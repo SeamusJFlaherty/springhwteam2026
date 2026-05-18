@@ -1,0 +1,121 @@
+---
+title: "fraud1"
+output: html_document
+date: "2026-03-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(max.print = 100000)
+
+library(dplyr)
+library(FNN)
+library(lubridate)
+```
+
+```{r}
+fraud<-read.csv("aggregated_policy_nolabel_2026.csv")
+```
+
+```{r}
+fraud$Date_Initial <- mdy(fraud$Date_Initial)
+fraud$Birthday <- dmy(fraud$Birthday)
+condition <- fraud$Birthday > Sys.Date() & 
+             format(fraud$Birthday, "%y") != format(Sys.Date(), "%y")
+fraud$Birthday[condition] <- as.Date(
+  paste0("19", format(fraud$Birthday[condition], "%y-%m-%d"))
+)
+```
+
+```{r}
+fraud$Age <- as.numeric(Sys.Date() - fraud$Birthday) / 365
+fraud$Location <- paste(fraud$City, fraud$State, sep = ", ")
+fraud$Location <- paste(fraud$Location, fraud$ZipCode, sep = " ")
+fraud <- fraud %>%
+  mutate(reward_cause = case_when(
+    Reward_Reason >= 100 & Reward_Reason <= 199 ~ "Accidental Death",
+    Reward_Reason >= 200 & Reward_Reason <= 299 ~ "Criminal Acts",
+    Reward_Reason >= 300 & Reward_Reason <= 499 ~ "Health Related Causes",
+    Reward_Reason >= 500 & Reward_Reason <= 549 ~ "Dangerous Activity - Exclusion",
+    Reward_Reason >= 550 & Reward_Reason <= 559 ~ "War - Exclusion",
+    Reward_Reason >= 560 & Reward_Reason <= 569 ~ "Aviation – Exclusion",
+    Reward_Reason >= 570 & Reward_Reason <= 579 ~ "Suicide – Exclusion",
+    TRUE ~ "Other"
+  ))
+fraud$adj_zip_match <- fraud$ZipCode == fraud$Adj_ZIP
+fraud <- fraud %>%
+  mutate(across(starts_with("MedF"), ~ ifelse(. == "Y", 1, 0)))
+fraud <- fraud %>%
+  mutate(across(starts_with("MedM"), ~ ifelse(. == "Y", 1, 0)))
+fraud <- fraud %>%
+  mutate(across(starts_with("Tobacco_IN"), ~ ifelse(. == "Y", 1, 0)))
+fraud <- fraud %>%
+  mutate(across(starts_with("Caffeine_IN"), ~ ifelse(. == "Y", 1, 0)))
+fraud <- fraud %>%
+  mutate(across(starts_with("Alcohol_IN"), ~ ifelse(. == "Y", 1, 0)))
+fraud$Med_Conditions <- as.numeric(fraud$Med_Conditions)
+fraud$Ratio_CL_PopZIP <- as.numeric(fraud$Ratio_CL_PopZIP)
+fraud$Ratio_AdjZIP_PopZIP <- as.numeric(fraud$Ratio_AdjZIP_PopZIP)
+fraud$Diff_Cust_Inc_CZIPInc <- as.numeric(fraud$Diff_Cust_Inc_CZIPInc)
+fraud$FeetInches <- sapply(fraud$FeetInches, function(x) {
+  # Remove extra spaces
+  x <- gsub(" ", "", x)
+  
+  # Extract numbers before and after the '
+  matches <- unlist(regmatches(x, gregexpr("[0-9]+", x)))
+  
+  if(length(matches) == 2){
+    feet <- as.numeric(matches[1])
+    inches <- as.numeric(matches[2])
+    return(feet*12 + inches)
+  } else {
+    return(NA)  # in case the format is wrong
+  }
+})
+```
+```{r}
+dummies <- model.matrix(~ Type + reward_cause + Location + Marriage + BloodType - 1, data = fraud)
+```
+
+```{r}
+fraud_clean <- fraud %>%
+  select(
+    -GivenName, -MiddleInitial, -Surname, -StreetAddress, -City, -State, -ZipCode, -TelephoneNumber, -MothersMaiden, -Date_Initial, -Cust_ID, -Cov_ID, -Adj_ID, -Tech_ID, -Adj_ZIP, -Birthday, -Country, -Type, -reward_cause, -Location, -Marriage, -BloodType, -adj_zip_match, -Exclusion_Payout, - R_Greater_CL, - IN_LessThan_60, -Zip_per_CustID
+  )
+```
+
+```{r}
+fraud_final <- cbind(fraud_clean, dummies)
+```
+
+```{r}
+fraud_final <- data.frame(lapply(fraud_final, function(x) {
+  x[is.na(x)] <- median(x, na.rm = TRUE)
+  x
+}))
+```
+
+```{r}
+fraud_scaled <- scale(fraud_final)
+```
+
+```{r}
+knn <- get.knn(fraud_scaled, k = 10)
+fraud$knn_score <- rowMeans(knn$nn.dist)
+```
+
+```{r}
+hist(fraud$knn_score)
+```
+
+```{r}
+#threshold <- quantile(fraud$knn_score, 0)
+outliers <- fraud[fraud$knn_score > 100, ]
+```
+
+```{r}
+single_column_df <- outliers["Cust_ID"] 
+write.csv(single_column_df, file = "knn_customer_ids.csv", row.names = FALSE)
+```
+
+

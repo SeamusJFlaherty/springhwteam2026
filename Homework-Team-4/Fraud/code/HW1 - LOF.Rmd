@@ -1,0 +1,411 @@
+---
+title: "Fraud HW 1"
+author: "Gray Nico"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readr)
+library(MASS)
+library(dbscan)
+
+df_raw <- read_csv("aggregated_policy_nolabel_2026.csv")
+
+# Necessary variable cleaning
+df <- df_raw %>%
+  mutate(
+    Birthday = as.Date(Birthday, format = "%d-%b-%y"),
+    Birthday = if_else(Birthday > Sys.Date(), Birthday - lubridate::years(100), Birthday),
+    ZipCode = as.character(ZipCode),
+    Diff_Cust_Inc_CZIPInc = as.numeric(Diff_Cust_Inc_CZIPInc),
+    Ratio_CL_PopZIP = as.numeric(Ratio_CL_PopZIP),
+    Ratio_AdjZIP_PopZIP = as.numeric(Ratio_AdjZIP_PopZIP),
+    Med_Conditions = as.numeric(Med_Conditions)
+  ) %>%
+  
+  # FEETINCHES CLEANING
+  mutate(FeetInches = gsub("['\"]", "", FeetInches)) %>%  # strip ' and "
+  separate(FeetInches, into = c("feet", "inches"), sep = "\\s+", convert = TRUE) %>%
+  mutate(feet_inches = feet + inches / 10) %>%
+  dplyr::select(-feet, -inches)
+
+```
+
+## Data Exploration
+
+The code below creates 6 flags that can be used to pull out IDs that have suspicious
+values in multiple fields. IDs that were flagged have been saved in separate
+vectors for comparisons.
+
+- **Mismatched Zipcode:** the given city-zipcode match is not identical to a verified
+list of city-zipcode pairings.
+  - Note that this is an extremely aggressive flag, and there are many cases
+  where the provided city was simply another version or abbreviation for the
+  verified city
+- **Missing Zipcode:** the given zipcode was not found in a verified dataset of
+USA zipcodes.
+  - Note that this may incorrectly flag zipcodes belonging to another country.
+- **Suspicious Birthday:** provided birthday was on January 1st, or on the 1st
+or 15th of another month.
+  - Note that this is very aggressive; this should only be used along with many
+  other flags for consideration.
+- **Suspicious Telephone:** provided phone number matches at least one suspicious
+pattern (e.g., 000, 999, invalid area code, 7+ repeated digits, sequential, etc.)
+- **Suspicious Amount:** reward amount was an outlying value, given the policy type and reward reason
+- **Suspicious Income:** customer has a very large income compared to zipcode median, with an unusually high claim rate compared to zipcode rate, and experienced a very high change in income compared to zipcode population
+- **Suspicious Claim Behavior:** customer frequently changed coverage limits with a high recent volatility, and claimed a reward shortly after last change
+
+```{r Check Zipcode Matches}
+
+zipcodes <- read_csv("uszips.csv")
+
+# Left join table A with table B on the zip code
+df <- df %>%
+  left_join(zipcodes %>% dplyr::select(zip, city), 
+            by = c("ZipCode" = "zip")) %>%
+  mutate(
+    zip_flag = case_when(
+      is.na(city)          ~ 2L,   # Zip not found in table B at all
+      City != city         ~ 1L,   # Zip found but city doesn't match
+      TRUE                 ~ 0L    # All good
+    ),
+    zip_city_matches = if_else(
+      !is.na(city),
+      paste0(City, " | ", city),   # "Table A city | Table B city"
+      paste0(City, " | N/A")       # Zip wasn't in table B
+    )
+  ) %>%
+  dplyr::select(-city)  # Drop the lookup column from table B
+
+# --- Extract Cust_IDs ---
+
+# Cust_IDs where city didn't match (zip exists in B but wrong city)
+mismatch_ids <- df %>%
+  filter(zip_flag == 1) %>%
+  pull(Cust_ID)
+
+# Cust_IDs where zip wasn't found in table B at all
+missing_zip_ids <- df %>%
+  filter(zip_flag == 2) %>%
+  pull(Cust_ID)
+
+# View rows and relevant columns where the flag was 1
+df %>%
+  filter(zip_flag %in% c(1)) %>%
+  dplyr::select(Cust_ID, zip_city_matches)
+
+```
+
+```{r Check Birthdays}
+
+# --- Check 1: Day-of-month distribution (rounding/fabrication signal) ---
+# Fabricated birthdays cluster heavily on the 1st, 15th, round numbers
+df %>%
+  mutate(day = as.integer(format(as.Date(Birthday), "%d"))) %>%
+  count(day) %>%
+  ggplot(aes(x = day, y = n)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Births by Day of Month", x = "Day", y = "Count") +
+  theme_minimal()
+
+# --- Check 2: Month distribution (should be roughly uniform-ish) ---
+df %>%
+  mutate(month = as.integer(format(as.Date(Birthday), "%m"))) %>%
+  count(month) %>%
+  ggplot(aes(x = factor(month), y = n)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Births by Month", x = "Month", y = "Count") +
+  theme_minimal()
+
+# --- Check 3: Year distribution (spot WWII dip, Baby Boom spike) ---
+df %>%
+  mutate(year = as.integer(format(as.Date(Birthday), "%Y"))) %>%
+  count(year) %>%
+  ggplot(aes(x = year, y = n)) +
+  geom_line(color = "steelblue") +
+  labs(title = "Births by Year", x = "Year", y = "Count") +
+  theme_minimal()
+
+# --- Check 4: Flag suspicious birthdays (1st of month, Jan 1st, etc.) ---
+df <- df %>%
+  mutate(
+    bday_day   = as.integer(format(as.Date(Birthday), "%d")),
+    bday_month = as.integer(format(as.Date(Birthday), "%m")),
+    bday_flag  = case_when(
+      bday_month == 1 & bday_day == 1 ~ "Jan 1st (likely placeholder)",
+      bday_day == 1                   ~ "1st of month (possible rounding)",
+      bday_day == 15                  ~ "15th of month (possible rounding)",
+      TRUE                            ~ "OK"
+    )
+  )
+
+susp_bday_ids <- df %>%
+  filter(bday_flag != "OK") %>%
+  pull(Cust_ID)
+
+```
+
+```{r Check Telephone Numbers}
+
+df <- df %>%
+  mutate(
+    phone_clean = gsub("[^0-9]", "", TelephoneNumber),
+    phone_flag = case_when(
+      nchar(phone_clean) != 10                                                          ~ 1L,  # wrong length
+      grepl("^555", phone_clean)                                                        ~ 1L,  # 555 numbers
+      grepl("^(000|911|999)", phone_clean)                                              ~ 1L,  # invalid area codes
+      grepl("(\\d)\\1{6,}", phone_clean)                                               ~ 1L,  # 7+ repeated digits
+      grepl("^(1234567890|0987654321)", phone_clean)                                   ~ 1L,  # sequential
+      substr(phone_clean, 1, 3) %in% c("000", "100", "200", "300", "400", "500") ~ 1L,  # unlikely area codes
+      substr(phone_clean, 4, 6) %in% c("555", "000", "111")                           ~ 1L,  # suspicious exchanges
+      TRUE                                                                              ~ 0L
+    )
+  )
+
+susp_phone_ids <- df %>%
+  filter(phone_flag == 1) %>%
+  pull(Cust_ID)
+
+```
+
+```{r Checking Physical Implausibility - UNUSED}
+
+df <- df %>%
+  mutate(
+    feet            = floor(feet_inches),
+    inches          = round((feet_inches - floor(feet_inches)) * 10),
+    height_in_total = feet * 12 + inches,
+    bmi             = (Pounds / height_in_total^2) * 703,
+    physical_flag   = case_when(
+      Pounds < 90 | Pounds > 400                   ~ 1L,  # outside broad healthy adult range
+      height_in_total < 54 | height_in_total > 84  ~ 1L,  # outside 4'6" to 7'0"
+      bmi < 13 | bmi > 55                          ~ 1L,  # outside survivable BMI range
+      TRUE                                         ~ 0L
+    )
+  ) %>%
+  dplyr::select(-feet, -inches, -height_in_total, -bmi)
+
+susp_bmi_ids <- df %>%
+  filter(physical_flag == 1) %>%
+  pull(Cust_ID)
+
+# No suspicious BMIs
+
+```
+
+```{r Checking Reward Amount Anomalies}
+
+df <- df %>%
+  group_by(Type, Reward_Reason) %>%
+  mutate(
+    reward_mean = mean(Reward_Amount, na.rm = TRUE),
+    reward_sd   = sd(Reward_Amount, na.rm = TRUE),
+    reward_z    = (Reward_Amount - reward_mean) / reward_sd,
+    reward_flag = if_else(abs(reward_z) > 3, 1L, 0L)
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-reward_mean, -reward_sd, -reward_z)
+
+susp_amt_ids <- df %>%
+  filter(reward_flag == 1) %>%
+  pull(Cust_ID)
+
+```
+
+```{r Checking Income Inconsistencies}
+
+df <- df %>%
+  mutate(
+    geo_income_flag = case_when(
+      abs(Diff_Cust_Inc_CZIPInc) > 2 * sd(Diff_Cust_Inc_CZIPInc, na.rm = TRUE) &
+        Ratio_CL_PopZIP > quantile(Ratio_CL_PopZIP, 0.95, na.rm = TRUE)  ~ 1L,  # high claim ZIP + income outlier
+      abs(Zscore_Inc_Change) > 3                                                    ~ 1L,  # extreme income change
+      TRUE                                                                      ~ 0L
+    )
+  )
+
+susp_income_ids <- df %>%
+  filter(geo_income_flag == 1) %>%
+  pull(Cust_ID)
+
+```
+
+```{r Checking Coverage Changes}
+
+df <- df %>%
+  mutate(
+    churn_flag = case_when(
+      Number_Changes > quantile(Number_Changes, 0.95, na.rm = TRUE) &
+        SD_CovLim_Last_6mon > quantile(SD_CovLim_Last_6mon, 0.95, na.rm = TRUE) &
+        Time_Between_CH_R < 90                                            ~ 1L,  # churned + claimed fast
+      Time_Between_CH_R < 30 & Number_Changes >= 3                   ~ 1L,  # very fast claim after repeated changes
+      TRUE                                                                     ~ 0L
+    )
+  )
+
+susp_claims_ids <- df %>%
+  filter(churn_flag == 1) %>%
+  pull(Cust_ID)
+
+```
+
+```{r Scoring IDs}
+
+# --- Step 1: Tag each ID with its source vector ---
+reasonable_flags <- bind_rows(
+  data.frame(Cust_ID = mismatch_ids,    flag = "mismatch_ids"),
+  data.frame(Cust_ID = missing_zip_ids, flag = "missing_zip_ids"),
+  data.frame(Cust_ID = susp_bday_ids,   flag = "susp_bday_ids"),
+  data.frame(Cust_ID = susp_phone_ids,  flag = "susp_phone_ids")
+)
+
+concerning_flags <- bind_rows(
+  data.frame(Cust_ID = susp_amt_ids,    flag = "susp_amt_ids"),
+  data.frame(Cust_ID = susp_income_ids, flag = "susp_income_ids"),
+  data.frame(Cust_ID = susp_claims_ids, flag = "susp_claims_ids")
+)
+
+# --- Step 2: Count flags per ID by category ---
+reasonable_counts <- reasonable_flags %>%
+  distinct(Cust_ID, flag) %>%          # deduplicate in case an ID appears twice in same vector
+  group_by(Cust_ID) %>%
+  summarise(
+    n_reasonable     = n(),
+    reasonable_flags = paste(flag, collapse = ", "),
+    .groups = "drop"
+  )
+
+concerning_counts <- concerning_flags %>%
+  distinct(Cust_ID, flag) %>%
+  group_by(Cust_ID) %>%
+  summarise(
+    n_concerning     = n(),
+    concerning_flags = paste(flag, collapse = ", "),
+    .groups = "drop"
+  )
+
+# --- Step 3: Merge and fill zeros for IDs missing from either category ---
+flag_summary <- full_join(reasonable_counts, concerning_counts, by = "Cust_ID") %>%
+  mutate(
+    n_reasonable     = replace_na(n_reasonable, 0),
+    n_concerning     = replace_na(n_concerning, 0),
+    reasonable_flags = replace_na(reasonable_flags, "none"),
+    concerning_flags = replace_na(concerning_flags, "none")
+  )
+
+# --- Step 4: Score ---
+flag_summary <- flag_summary %>%
+  mutate(
+    fraud_score = case_when(
+      n_concerning == 3 & n_reasonable >= 2  ~ 10L,
+      n_concerning == 3 & n_reasonable == 1  ~  9L,
+      n_concerning == 3 & n_reasonable == 0  ~  8L,
+      n_concerning == 2 & n_reasonable >= 2  ~  7L,
+      n_concerning == 2 & n_reasonable == 1  ~  6L,
+      n_concerning == 2 & n_reasonable == 0  ~  5L,
+      n_concerning == 1 & n_reasonable >= 3  ~  4L,
+      n_concerning == 1 & n_reasonable %in% c(1, 2) ~  3L,
+      n_concerning == 1 & n_reasonable == 0  ~  2L,
+      n_concerning == 0 & n_reasonable >= 2  ~  1L,
+      n_concerning == 0 & n_reasonable == 1  ~  0L,
+      TRUE                                   ~  NA_integer_  # only 1 reasonable flag; no action needed
+    )
+  ) %>%
+  arrange(desc(fraud_score))
+
+# IDs with a score of 5 or higher
+high_susp_ids <- flag_summary %>% 
+  filter(fraud_score >= 5) %>%
+  pull(Cust_ID)
+
+```
+
+## LOF Analysis
+
+This section uses the code provided by Dr. Simmons to use the Local Outlier Factor (LOF) on multiple variables. 
+
+```{r Data Prepping}
+
+# Ensuring that all numeric variables are handled properly
+cols <- data.frame(
+  column = character(),
+  type = character()
+)
+for (col in colnames(df)){
+  cols <- rbind(cols, data.frame(column = col, type = class(df[[col]])[1]))
+}
+
+chars <- cols %>% filter(type == "character")
+nums <- cols %>% filter(type == "numeric")
+
+# Creating a df with numeric ccolumns of interest
+df_nums <- df %>%
+  dplyr::select(
+    Cust_ID,
+    Reward_Amount, # *
+    Number_Changes, # *
+    Cov_Limit_Claim, # *
+    Income_Claim, # *
+    Adj_Tech_Confidence, # *
+    Tech_Adj_Confidence, # *
+    Coverage_Income_Ratio_Claim, # *
+    Coverage_Income_Ratio_Initial, # *
+    Time_Between_CL_R, # *
+    Time_Between_IN_CL, # * 
+    Med_Conditions, # *
+    Pol_Count, # *
+    Ratio_CL_PopZIP,
+    Zscore_Inc_Change, # *
+    CH_per_Year, # *
+    Time_Between_CH_R, # *
+    PerSize_Last_CH, # *
+    Ratio_CH_TimeCompany, # *
+    Diff_Cust_Inc_CZIPInc,
+    Ratio_AdjZIP_PopZIP, # *
+    SD_CovLim_Last_6mon # *
+  )
+
+df_clean <- na.omit(df_nums)
+
+```
+
+```{r LOF}
+
+# Separate ID from numeric columns
+ids <- df_clean$Cust_ID
+df_scale <- df_clean[, !colnames(df_clean) %in% "Cust_ID"]
+
+# Remove zero-variance columns and scale
+df_scale <- df_scale[, sapply(df_scale, function(x) sd(x) > 0)]
+lof_scores <- lof(scale(df_scale), minPts = 5)
+
+# Attaching scores
+df_scale$lof_score <- lof_scores
+
+# Attaching ID
+df_scale$ID <- ids
+
+# Outputting IDs with a LOF score of 1.35 or higher
+
+susp_LOF_ids <- df_scale %>%
+  filter(lof_score >= 1.35) %>%
+  pull(ID)
+
+```
+
+This code produced a new vector of IDs based on LOF score. 1319 customers had a score of 1.35 or higher.
+
+As a final check, the below code saves IDs identified as both highly suspicious from the custom flags, AND identified as highly suspicious from the LOF scoring. Only 66 fall into this group, but they are very likely to be fraudulent.
+
+```{r Final Check}
+
+final_ids <- intersect(high_susp_ids, susp_LOF_ids)
+
+```
+
+
+
