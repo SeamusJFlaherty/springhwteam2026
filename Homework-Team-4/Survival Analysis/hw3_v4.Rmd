@@ -1,0 +1,253 @@
+---
+title: "survival.analysis"
+author: "Team 4"
+date: "2026-01-23"
+output: html_document
+---
+
+```{r}
+library(survival)
+library(foreign)
+library(ggplot2)
+library(survminer)
+library(rms)
+library(flexsurv)
+library(dplyr)
+library(ciTools)
+library(here)
+library(visreg)
+library(cmprsk)
+library(reticulate)
+library(MASS)
+library(tidyr)
+
+use_python("C:\\ProgramData\\Anaconda3\\python.exe")
+```
+
+
+```{r}
+library(aws.s3)
+
+#Finding the AWS S3 bucket
+bucket_exists(
+  bucket = "s3://survival2024/",
+  region = "us-east-1"
+)
+```
+
+```{r}
+files <- get_bucket_df(
+  bucket = "s3://survival2024/",
+  region = "us-east-1",
+  max = 20000
+) %>%
+  as_tibble()
+
+save_object(
+  object = "hurricane.csv", 
+  bucket = "s3://survival2024/", 
+  region = "us-east-1", 
+  file = "hurricane_file"
+)
+
+# Read it into a new dataframe called 'pumps'
+pumps <- read.csv("hurricane_file")
+
+```
+
+
+
+
+For this phase use the entire data set.
+Build a Cox proportional hazard model for motor failure with main effects only using
+backward elimination.
+```{r}
+#create event motor failure variable
+pumps <- pumps |>
+  mutate(motor_event = ifelse(reason == 2, 1, 0))
+
+#run backward selection
+full.model <- coxph(Surv(hour, motor_event) ~ backup + age + bridgecrane + 
+                       servo + gear + trashrack + slope + elevation, data=pumps)
+
+n <- nrow(pumps)
+bic.model <- stepAIC(full.model, direction="backward", k=log(n))
+
+summary(bic.model)
+
+```
+
+```{r}
+#confirm quasi complete separation between trashrack and motor_event
+table(pumps$trashrack, pumps$motor_event)
+
+#remove trashrack from backward selection model
+#run backward selection
+final.model <- coxph(Surv(hour, motor_event) ~ age + slope, data=pumps)
+summary(final.model)
+```
+Bin continuous variables that don't meet linearity assumption
+```{r}
+#create the quartiles for age and slope
+pumps$age_bin <- cut(pumps$age, 
+                     breaks = quantile(pumps$age, probs = seq(0, 1, 0.25), na.rm = TRUE),
+                     include.lowest = TRUE, 
+                     labels = c("Q1_young", "Q2", "Q3", "Q4_old"))
+pumps$slope_bin <- cut(pumps$slope, 
+                     breaks = quantile(pumps$slope, probs = seq(0, 1, by = 1/3), na.rm = TRUE),
+                     include.lowest = TRUE, 
+                     labels = c("T1", "T2", "T3"))
+
+#get slope ranges
+qs <- quantile(pumps$slope, probs = seq(0, 1, by = 1/3), na.rm = TRUE)
+data.frame(
+  Quartile = c("T1", "T2", "T3"),
+  Range = paste0("[", qs[-length(qs)], ", ", qs[-1], "]")
+)
+
+#hist(pumps$slope)
+#run cox model with the binned variable
+bin.model <- coxph(Surv(hour, motor_event) ~ age_bin + slope_bin, data = pumps)
+
+# 3. View the Hazard Ratios
+summary(bin.model)
+
+```
+Test proportional hazards for binned model
+```{r}
+#Schoenfeld residuals to test for proportional hazards
+ph_test <- cox.zph(bin.model)
+print(ph_test)
+
+#high p-value -> fail to reject -> hazards ARE proportional
+```
+
+***************************************
+The Army Corp of Engineers and the Committee are interested in finding out if this type of
+failure is more likely to occur if the motor is constantly running for 12 hours blocks.
+```{r}
+#adjust to counting long format (one row per hour)
+pumps_long <- pumps |>
+  mutate(id = row_number()) |>
+  dplyr::select(id, hour, motor_event, age, trashrack, slope, h1:h48) |> #drop vars not in model
+  pivot_longer(
+               cols = c(starts_with("h") , -hour),
+               names_to = "time_point",
+               values_to = "is_running") |>
+  mutate(time_point = as.numeric(gsub("h", "", time_point))) |>
+  filter(time_point <= hour) |> #remove rows after failure
+  arrange(id, time_point)
+
+#create flag for 12-hr block
+pumps_long <- pumps_long |>
+  group_by(id) |>
+  mutate(
+    run_streak = sequence(rle(is_running)$lengths) * is_running, #if is_running is 0, streak resets, else it adds up
+    twelve.hr = ifelse(run_streak >=12, 1, 0), #accounts for 12+ hrs consecutive run
+    tstart = time_point - 1, #beginning of the single hour
+    tstop = time_point, #end of the single hour
+    event_status = ifelse(time_point == hour & motor_event == 1, 1, 0)
+        ) |>
+  ungroup()
+
+
+#build time-dependent Cox PH model
+time.model <- coxph(Surv(tstart, tstop, event_status) ~ age + slope + twelve.hr, 
+                  data = pumps_long)
+
+
+summary(time.model) #We find that twelve.hr flag is NOT significant
+
+#View(pumps_long)
+
+```
+
+
+Test assumptions for model
+```{r}
+#Schoenfeld residuals to test for proportional hazards
+ph_test <- cox.zph(time.model)
+print(ph_test)
+```
+
+```{r}
+library(survminer)
+
+# ggcoxfunctional automatically checks the linearity of continuous covariates
+# It fits a null model and plots the variable against the martingale residuals
+ggcoxfunctional(final.model, data = pumps)
+
+log.model <- coxph(Surv(hour, motor_event) ~ log(age) + slope, data=pumps)
+summary(log.model)
+ggcoxfunctional(log.model, data = pumps)
+```
+
+
+
+Re-do time dependent model with binned vars
+```{r}
+#adjust to counting long format (one row per hour)
+pumps_long <- pumps |>
+  mutate(id = row_number()) |>
+  dplyr::select(id, hour, motor_event, age_bin, trashrack, slope_bin, h1:h48) |> #drop vars not in model
+  pivot_longer(
+               cols = c(starts_with("h") , -hour),
+               names_to = "time_point",
+               values_to = "is_running") |>
+  mutate(time_point = as.numeric(gsub("h", "", time_point))) |>
+  filter(time_point <= hour) |> #remove rows after failure
+  arrange(id, time_point)
+
+#create flag for 12-hr block
+pumps_long <- pumps_long |>
+  group_by(id) |>
+  mutate(
+    run_streak = sequence(rle(is_running)$lengths) * is_running, #if is_running is 0, streak resets, else it adds up
+    twelve.hr = ifelse(run_streak >=12, 1, 0), #accounts for 12+ hrs consecutive run
+    tstart = time_point - 1, #beginning of the single hour
+    tstop = time_point, #end of the single hour
+    event_status = ifelse(time_point == hour & motor_event == 1, 1, 0)
+        ) |>
+  ungroup()
+
+#build time-dependent Cox PH model with binned variables
+time.model <- coxph(Surv(tstart, tstop, event_status) ~ age_bin + slope_bin + twelve.hr, 
+                  data = pumps_long)
+
+
+summary(time.model) #We find that twelve.hr flag is NOT significant
+```
+Repeat backward selection with binned vars
+```{r}
+#create event motor failure variable
+pumps <- pumps |>
+  mutate(motor_event = ifelse(reason == 2, 1, 0))
+
+#run backward selection
+full.model <- coxph(Surv(hour, motor_event) ~ backup + age_bin + bridgecrane + 
+                       servo + gear + trashrack + slope_bin + elevation, data=pumps)
+
+n <- nrow(pumps)
+bic.model <- stepAIC(full.model, direction="backward", k=log(n))
+
+summary(bic.model)
+
+```
+Remove trash rack
+```{r}
+final.model <- coxph(Surv(hour, motor_event) ~ factor(age_bin) + factor(slope_bin), data=pumps)
+summary(final.model)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
